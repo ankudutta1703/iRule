@@ -1,0 +1,85 @@
+when RULE_INIT {
+	set static::rule_ver "0.9"
+	# 0 = no logging except for errors
+	# 1 = enable logging for exceptions
+	# 2 = verbose logging for debugging
+	set static::smpp_debug 2
+	log local0.info "rule_smpp_irule_v$static::rule_ver initialized!"
+}
+when CLIENT_ACCEPTED {
+	if { $static::smpp_debug > 0} {
+		set debug_uid [expr {int ( [expr srand([clock clicks])] * 100000000)}]
+		if { $static::smpp_debug > 1} {
+			log local0. "\[INFO\] uid=$debug_uid msg=\"New request from client: [IP::client_addr]:[TCP::client_port] to server: [IP::local_addr]:[TCP::local_port]\""
+		}
+	TCP::collect
+	}
+}
+when CLIENT_DATA {
+	set client_ip [IP::client_addr]
+    set client_info "[IP::client_addr]:[TCP::client_port]"
+	set smpp_data [TCP::payload]		
+	binary scan $smpp_data II smpp_command_length smpp_command_id
+	if { $static::smpp_debug > 1} {
+		log local0. "\[INFO\] uid=$debug_uid msg=\"SMPP command_length: $smpp_command_length, command_id: $smpp_command_id\""
+	}
+	if { [TCP::payload length] >= $smpp_command_length } {
+		if { $smpp_command_id == 1 || $smpp_command_id == 2 || $smpp_command_id == 9 } {
+			binary scan $smpp_data @16a* system_id_with_null
+			set system_id [string trimright $system_id_with_null \x00]
+			if { $static::smpp_debug > 0} {
+				log local0. "\[INFO\] uid=$debug_uid msg=\"Valid SMPP bind request from client: $client_ip with command_id:$smpp_command_id system_id: $system_id\""
+			}		
+			if { [TCP::payload length] == 42 } {
+				set new_smpp_command_length [expr {$smpp_command_length + 12}]
+				if { $static::smpp_debug > 0 } {
+					log local0. "\[INFO\] uid=$debug_uid msg=\"Original command_length: $smpp_command_length, New command_length: $new_smpp_command_length\""
+				}	
+				set final_cmd_len [binary format I $new_smpp_command_length]
+				set length_minus_two [expr {$smpp_command_length - 1}]
+                TCP::payload replace $length_minus_two 0 $client_ip
+				TCP::payload replace 0 4 $final_cmd_len
+				if { $static::smpp_debug > 0} {
+					log local0. "\[INFO\] uid=$debug_uid msg=\"Payload replaced and Releasing modified payload to backend server\""
+				}
+				TCP::release	
+		    } else {
+				if { $static::smpp_debug > 0} {
+					log local0. "\[INFO\] uid=$debug_uid msg=\"Unable to insert the client IP due to TCP paylaod size mismatch\""
+				}
+			}		
+			table set $system_id $client_info 3600 86400
+			if { $static::smpp_debug > 1} {
+				log local0. "\[INFO\] uid=$debug_uid msg=\"Session persisted in table with system_id: $system_id, client_info: $client_info\""
+			}
+			persist uie $system_id
+			if { $static::smpp_debug > 0} {
+				log local0. "\[INFO\] uid=$debug_uid msg=\"Session persisted with system_id: $system_id\""
+			}
+		}
+	}
+}
+when SERVER_CONNECTED {
+    set session_info [table lookup $system_id]
+    if { $session_info ne "" } {
+		if { $static::smpp_debug > 0} {
+			log local0. "\[INFO\] uid=$debug_uid msg=\"Established connection to server: [LB::server addr] based on the session in table for system_id: $system_id\""
+		}   
+	} else {
+		if { $static::smpp_debug > 0} {
+			log local0. "\[INFO\] uid=$debug_uid msg=\"No session found for system_id: $system_id\""
+		}
+    }
+}
+when CLIENT_CLOSED {
+	if { $static::smpp_debug > 1} {
+		log local0. "\[INFO\] uid=$debug_uid msg=\"Client-side connection closed\""
+	}
+    if {[LB::server] ne ""} {
+        LB::detach
+        TCP::close
+		if { $static::smpp_debug > 0} {
+			log local0. "\[INFO\] uid=$debug_uid msg=\"Server-side connection closed due to client disconnect\""
+		}
+	}
+}
